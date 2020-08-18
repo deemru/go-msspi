@@ -14,6 +14,7 @@ git clone https://github.com/deemru/go-msspi --recursive
 cd go-msspi/msspi/build_linux
 make
 cd ../..
+go get
 go test
 ```
 

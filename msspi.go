@@ -1,7 +1,8 @@
 package msspi
 
 /*
-#cgo LDFLAGS: -Lmsspi/build_linux -lmsspi -lstdc++ -lcrypt32
+#cgo windows LDFLAGS: -Lmsspi/build_linux -lmsspi -lstdc++ -lcrypt32
+#cgo linux LDFLAGS: -Lmsspi/build_linux -lmsspi-capix -lstdc++ -ldl
 #include "msspi/src/msspi.h"
 extern int cgo_msspi_read( void * goPointer, void * buf, int len );
 extern int cgo_msspi_write( void * goPointer, void * buf, int len );
@@ -70,10 +71,10 @@ func (c *Conn) Write(b []byte) (int, error) {
 // Close with MSSPI
 func (c *Conn) Close() (err error) {
 	if c.handle != nil {
-		C.msspi_shutdown(c.handle);
-		pointer.Unref(c.goPointer);
+		C.msspi_shutdown(c.handle)
+		pointer.Unref(c.goPointer)
 	}
-	return c.conn.Close();
+	return c.conn.Close()
 }
 
 // Finalizer with MSSPI
