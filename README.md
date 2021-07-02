@@ -18,6 +18,10 @@ go get
 go test
 ```
 
+## Notice for Windows
+
+The `make` step can be for example `mingw32-make.exe -B static`
+
 ## Usage
 
 - import "github.com/deemru/go-msspi"
