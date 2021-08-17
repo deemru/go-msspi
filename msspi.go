@@ -14,6 +14,7 @@ MSSPI_HANDLE cgo_msspi_open( void * goPointer ) {
 import "C"
 
 import (
+	"bytes"
 	"errors"
 	"net"
 	"runtime"
@@ -77,6 +78,14 @@ func (h *Handler) VersionTLS() uint16 {
 func (h *Handler) CipherSuite() uint16 {
 	info := C.msspi_get_cipherinfo(h.handle)
 	return uint16(info.dwCipherSuite)
+}
+
+func (h *Handler) ClientProtocol() string {
+	alpn := C.msspi_get_alpn(h.handle)
+	if alpn == nil {
+		return ""
+	}
+	return C.GoString(alpn)
 }
 
 func (c *Handler) PeerCertificates() (certificates [][]byte) {
@@ -183,6 +192,32 @@ func (c *Handler) Finalizer() {
 		C.msspi_close(c.handle)
 		c.handle = nil
 	}
+}
+
+// SetNextProtos with MSSPI
+func (c *Handler) SetNextProtos(NextProtos []string) error {
+
+	// https://github.com/golang/go/blob/dc00dc6c6bf3b5554e37f60799aec092276ff807/src/crypto/tls/handshake_client.go#L43-L53
+	nextProtosLength := 0
+	for _, proto := range NextProtos {
+		if l := len(proto); l == 0 || l > 255 {
+			return errors.New("tls: invalid NextProtos value")
+		} else {
+			nextProtosLength += 1 + l
+		}
+	}
+	if nextProtosLength > 0xffff {
+		return errors.New("tls: NextProtos values too large")
+	}
+
+	var alpns bytes.Buffer
+	for _, proto := range NextProtos {
+		alpns.WriteByte(byte(len(proto)))
+		alpns.WriteString(proto)
+	}
+
+	C.msspi_set_alpn(c.handle, (*C.char)(unsafe.Pointer(&alpns.Bytes()[0])), C.uint(alpns.Len()))
+	return nil
 }
 
 // Client with MSSPI
