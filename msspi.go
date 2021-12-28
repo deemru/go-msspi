@@ -245,8 +245,9 @@ func Client(conn *net.Conn, CertificateBytes [][]byte, hostname string) (c *Hand
 		ok := int(C.msspi_add_mycert(c.handle, (*C.char)(unsafe.Pointer(&cbs[0])), C.int(len(cbs))))
 		if ok != 1 {
 			return nil, errors.New("Client msspi_add_mycert() failed")
+		} else {
+			break // only 1 cert for client
 		}
-		break
 	}
 
 	return c, nil
@@ -276,7 +277,6 @@ func Server(conn *net.Conn, CertificateBytes [][]byte, clientAuth bool) (c *Hand
 		if ok != 1 {
 			return nil, errors.New("Server msspi_add_mycert() failed")
 		}
-		break
 	}
 
 	return c, nil
