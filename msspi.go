@@ -1,7 +1,7 @@
 package msspi
 
 /*
-#cgo windows LDFLAGS: -Lmsspi/build_linux -lmsspi -lstdc++ -lcrypt32
+#cgo windows LDFLAGS: -Lmsspi/build_linux -lmsspi -lstdc++ -lcrypt32 -static-libgcc -static -lpthread
 #cgo linux LDFLAGS: -Lmsspi/build_linux -lmsspi-capix -lstdc++ -ldl
 #cgo darwin LDFLAGS: -Lmsspi/build_linux -lmsspi-capix -lstdc++ -ldl
 #define NO_MSSPI_CERT
