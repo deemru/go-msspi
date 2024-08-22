@@ -217,7 +217,7 @@ func (c *Handler) SetNextProtos(NextProtos []string) error {
 		alpns.WriteString(proto)
 	}
 
-	C.msspi_set_alpn(c.handle, (*C.char)(unsafe.Pointer(&alpns.Bytes()[0])), C.uint(alpns.Len()))
+	C.msspi_set_alpn(c.handle, (*C.char)(unsafe.Pointer(&alpns.Bytes()[0])), C.size_t(alpns.Len()))
 	return nil
 }
 
