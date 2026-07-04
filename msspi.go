@@ -20,8 +20,10 @@ import "C"
 import (
 	"bytes"
 	"errors"
+	"io"
 	"net"
 	"runtime"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -33,11 +35,29 @@ import (
 // peer cannot block Close/CloseWrite forever.
 const closeNotifyTimeout = 5 * time.Second
 
+// Keep this chunk aligned with MSSPI_BASE_BUFFER_SIZE in msspi.cpp.
+const msspiBufferSize = 0x4800
+
 // Conn is a TLS connection whose handshake and record protection are handled by
 // msspi (CryptoPro CSP), supporting GOST as well as foreign algorithms.
 type Conn struct {
-	conn      *net.Conn
-	handle    C.MSSPI_HANDLE
+	conn   *net.Conn
+	handle C.MSSPI_HANDLE
+	// mu serializes the C.msspi_* calls that drive the record/handshake state
+	// machine. MSSPI callbacks run synchronously while mu is held, so callbacks
+	// and code reachable from them must never lock mu. The msspi_get_* accessors
+	// are intentionally lock-free so verify hooks can call them from callbacks.
+	mu sync.Mutex
+	// readMu preserves the single transport reader/inputBuf invariant while
+	// mu is released for blocking socket reads. Lock order is readMu -> mu;
+	// stepMSSPI always releases mu before calling readTransport.
+	readMu sync.Mutex
+	// input is filled by readTransport and drained by cgo_msspi_read_cb.
+	input    []byte
+	inputBuf [msspiBufferSize]byte
+	// output is staged by cgo_msspi_write_cb and flushed by flushTransportLocked.
+	output    []byte
+	outputBuf [msspiBufferSize]byte
 	rerr      error
 	werr      error
 	isClient  bool
@@ -55,14 +75,132 @@ func (c *Conn) Read(b []byte) (int, error) {
 	if c == nil || c.handle == nil {
 		return 0, net.ErrClosed
 	}
-	n := (int)(C.msspi_read(c.handle, unsafe.Pointer(&b[0]), C.int(len(b))))
-	return n, c.rerr
+	if len(b) == 0 {
+		return 0, nil
+	}
+	n, err := c.stepMSSPI(func() int {
+		return int(C.msspi_read(c.handle, unsafe.Pointer(&b[0]), C.int(len(b))))
+	})
+	if n == 0 && err == nil {
+		return 0, c.rerr
+	}
+	return n, err
 }
 
-func (c *Conn) State(val int) bool {
+func (c *Conn) Write(b []byte) (int, error) {
 	if c == nil || c.handle == nil {
-		return false
+		return 0, net.ErrClosed
 	}
+	sent := 0
+	for sent < len(b) {
+		n, err := c.stepMSSPI(func() int {
+			return int(C.msspi_write(c.handle, unsafe.Pointer(&b[sent]), C.int(len(b)-sent)))
+		})
+		if n > 0 {
+			sent += n
+		}
+		if err != nil || n <= 0 {
+			return sent, err
+		}
+	}
+	return sent, c.werr
+}
+
+// stepMSSPI drives one MSSPI operation until it returns a non-negative result
+// or a transport error. Blocking socket reads are performed outside mu; socket
+// writes are flushed outside cgo callbacks by afterMSSPILocked.
+func (c *Conn) stepMSSPI(op func() int) (int, error) {
+	for {
+		c.mu.Lock()
+		n := op()
+		needRead, err := c.afterMSSPILocked(n)
+		c.mu.Unlock()
+
+		if err != nil || n >= 0 {
+			return n, err
+		}
+		if needRead {
+			if err := c.readTransport(); err != nil {
+				return 0, err
+			}
+		}
+	}
+}
+
+// afterMSSPILocked runs under mu after every op(). It always flushes output
+// staged by the write callback; a successful op can have produced a full TLS
+// record. If the result was negative, it then reports whether stepMSSPI should
+// re-drive MSSPI immediately (WANT_WRITE or already-staged input) or call
+// readTransport to fetch more input bytes.
+func (c *Conn) afterMSSPILocked(n int) (bool, error) {
+	if err := c.flushTransportLocked(); err != nil {
+		return false, err
+	}
+	if n >= 0 {
+		return false, nil
+	}
+	state := C.msspi_state(c.handle)
+	if state&C.MSSPI_WRITING != 0 && state&C.MSSPI_READING == 0 {
+		return false, nil
+	}
+	if len(c.input) != 0 {
+		return false, nil
+	}
+	return true, nil
+}
+
+// readTransport is the only place that blocks on transport reads. It holds
+// readMu across the socket read so renegotiation cannot start two concurrent
+// reads into inputBuf; it holds mu only while checking or publishing input.
+func (c *Conn) readTransport() error {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+
+	c.mu.Lock()
+	if len(c.input) != 0 {
+		c.mu.Unlock()
+		return nil
+	}
+	c.mu.Unlock()
+
+	n, err := (*c.conn).Read(c.inputBuf[:])
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rerr = err
+	if n > 0 {
+		c.input = c.inputBuf[:n]
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return io.ErrNoProgress
+}
+
+// flushTransportLocked writes outbound TLS record bytes staged by
+// cgo_msspi_write_cb. The write is intentionally outside the cgo callback;
+// blocking here parks a Go goroutine in netpoll instead of pinning an OS thread
+// in cgo. It runs under mu, so backpressure stalls this Conn until the caller's
+// write deadline.
+func (c *Conn) flushTransportLocked() error {
+	for len(c.output) != 0 {
+		n, err := (*c.conn).Write(c.output)
+		c.werr = err
+		if n > 0 {
+			c.output = c.output[n:]
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		return io.ErrNoProgress
+	}
+	c.output = nil
+	return nil
+}
+
+func (c *Conn) stateLocked(val int) bool {
 	state := C.msspi_state(c.handle)
 	if val == 1 {
 		return state&C.MSSPI_ERROR != 0
@@ -73,24 +211,15 @@ func (c *Conn) State(val int) bool {
 	return false
 }
 
-func (c *Conn) Write(b []byte) (int, error) {
+func (c *Conn) State(val int) bool {
 	if c == nil || c.handle == nil {
-		return 0, net.ErrClosed
+		return false
 	}
-	len := len(b)
-	sent := 0
-	for len > 0 {
-		n := int(C.msspi_write(c.handle, unsafe.Pointer(&b[sent]), C.int(len)))
-		if n > 0 {
-			sent += n
-			len -= n
-			continue
-		}
-
-		break
-	}
-
-	return sent, c.werr
+	// Do not call State from MSSPI callbacks or verify hooks: callbacks are
+	// synchronous and run while mu is already held by stepMSSPI.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.stateLocked(val)
 }
 
 func (c *Conn) VersionTLS() uint16 {
@@ -198,13 +327,14 @@ func (c *Conn) Handshake() error {
 	if c == nil || c.handle == nil {
 		return net.ErrClosed
 	}
-	n := -1
-	for n < 0 {
+	n, err := c.stepMSSPI(func() int {
 		if c.isClient {
-			n = (int)(C.msspi_connect(c.handle))
-		} else {
-			n = (int)(C.msspi_accept(c.handle))
+			return int(C.msspi_connect(c.handle))
 		}
+		return int(C.msspi_accept(c.handle))
+	})
+	if err != nil {
+		return err
 	}
 
 	if n == 1 {
@@ -229,7 +359,13 @@ func (c *Conn) Close() (err error) {
 		// Bound the close_notify send like crypto/tls; the transport is closed
 		// right after, so the deadline does not need restoring.
 		(*c.conn).SetWriteDeadline(time.Now().Add(closeNotifyTimeout))
+		c.mu.Lock()
 		C.msspi_shutdown(c.handle)
+		if err = c.flushTransportLocked(); err != nil {
+			c.mu.Unlock()
+			return err
+		}
+		c.mu.Unlock()
 	}
 
 	if c.goPointer != nil {
@@ -249,12 +385,18 @@ func (c *Conn) Shutdown() (err error) {
 		// Half-close (CloseWrite): bound the close_notify send, then forbid any
 		// further writes, exactly as crypto/tls.Conn.closeNotify does.
 		(*c.conn).SetWriteDeadline(time.Now().Add(closeNotifyTimeout))
+		c.mu.Lock()
 		C.msspi_shutdown(c.handle)
+		if err = c.flushTransportLocked(); err != nil {
+			c.mu.Unlock()
+			return err
+		}
+		ok := !c.stateLocked(1) && c.stateLocked(2)
+		c.mu.Unlock()
 		(*c.conn).SetWriteDeadline(time.Now())
-	}
-
-	if !c.State(1) && c.State(2) {
-		return nil
+		if ok {
+			return nil
+		}
 	}
 
 	return net.ErrClosed
@@ -263,8 +405,10 @@ func (c *Conn) Shutdown() (err error) {
 // Finalizer with MSSPI
 func (c *Conn) Finalizer() {
 	if c.handle != nil {
+		c.mu.Lock()
 		C.msspi_close(c.handle)
 		c.handle = nil
+		c.mu.Unlock()
 	}
 }
 
