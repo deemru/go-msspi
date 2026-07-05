@@ -22,7 +22,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"runtime"
 	"sync"
 	"time"
 	"unsafe"
@@ -72,14 +71,14 @@ type Conn struct {
 }
 
 func (c *Conn) Read(b []byte) (int, error) {
-	if c == nil || c.handle == nil {
+	if c == nil {
 		return 0, net.ErrClosed
 	}
 	if len(b) == 0 {
 		return 0, nil
 	}
-	n, err := c.stepMSSPI(func() int {
-		return int(C.msspi_read(c.handle, unsafe.Pointer(&b[0]), C.int(len(b))))
+	n, err := c.stepMSSPI(func(handle C.MSSPI_HANDLE) int {
+		return int(C.msspi_read(handle, unsafe.Pointer(&b[0]), C.int(len(b))))
 	})
 	if n == 0 && err == nil {
 		return 0, c.rerr
@@ -88,13 +87,13 @@ func (c *Conn) Read(b []byte) (int, error) {
 }
 
 func (c *Conn) Write(b []byte) (int, error) {
-	if c == nil || c.handle == nil {
+	if c == nil {
 		return 0, net.ErrClosed
 	}
 	sent := 0
 	for sent < len(b) {
-		n, err := c.stepMSSPI(func() int {
-			return int(C.msspi_write(c.handle, unsafe.Pointer(&b[sent]), C.int(len(b)-sent)))
+		n, err := c.stepMSSPI(func(handle C.MSSPI_HANDLE) int {
+			return int(C.msspi_write(handle, unsafe.Pointer(&b[sent]), C.int(len(b)-sent)))
 		})
 		if n > 0 {
 			sent += n
@@ -109,10 +108,14 @@ func (c *Conn) Write(b []byte) (int, error) {
 // stepMSSPI drives one MSSPI operation until it returns a non-negative result
 // or a transport error. Blocking socket reads are performed outside mu; socket
 // writes are flushed outside cgo callbacks by afterMSSPILocked.
-func (c *Conn) stepMSSPI(op func() int) (int, error) {
+func (c *Conn) stepMSSPI(op func(C.MSSPI_HANDLE) int) (int, error) {
 	for {
 		c.mu.Lock()
-		n := op()
+		if c.handle == nil {
+			c.mu.Unlock()
+			return 0, net.ErrClosed
+		}
+		n := op(c.handle)
 		needRead, err := c.afterMSSPILocked(n)
 		c.mu.Unlock()
 
@@ -212,13 +215,16 @@ func (c *Conn) stateLocked(val int) bool {
 }
 
 func (c *Conn) State(val int) bool {
-	if c == nil || c.handle == nil {
+	if c == nil {
 		return false
 	}
 	// Do not call State from MSSPI callbacks or verify hooks: callbacks are
 	// synchronous and run while mu is already held by stepMSSPI.
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.handle == nil {
+		return false
+	}
 	return c.stateLocked(val)
 }
 
@@ -324,14 +330,14 @@ func (c *Conn) PeerChain() (certificates [][]byte) {
 }
 
 func (c *Conn) Handshake() error {
-	if c == nil || c.handle == nil {
+	if c == nil {
 		return net.ErrClosed
 	}
-	n, err := c.stepMSSPI(func() int {
+	n, err := c.stepMSSPI(func(handle C.MSSPI_HANDLE) int {
 		if c.isClient {
-			return int(C.msspi_connect(c.handle))
+			return int(C.msspi_connect(handle))
 		}
-		return int(C.msspi_accept(c.handle))
+		return int(C.msspi_accept(handle))
 	})
 	if err != nil {
 		return err
@@ -351,27 +357,24 @@ func (c *Conn) Handshake() error {
 }
 
 // Close with MSSPI
-func (c *Conn) Close() (err error) {
+func (c *Conn) Close() error {
 	if c == nil {
 		return net.ErrClosed
 	}
+
+	c.mu.Lock()
 	if c.handle != nil {
 		// Bound the close_notify send like crypto/tls; the transport is closed
 		// right after, so the deadline does not need restoring.
 		(*c.conn).SetWriteDeadline(time.Now().Add(closeNotifyTimeout))
-		c.mu.Lock()
 		C.msspi_shutdown(c.handle)
-		if err = c.flushTransportLocked(); err != nil {
-			c.mu.Unlock()
-			return err
-		}
-		c.mu.Unlock()
-	}
-
-	if c.goPointer != nil {
+		c.flushTransportLocked()
+		C.msspi_close(c.handle)
+		c.handle = nil
 		pointer.Unref(c.goPointer)
 		c.goPointer = nil
 	}
+	c.mu.Unlock()
 
 	return (*c.conn).Close()
 }
@@ -400,16 +403,6 @@ func (c *Conn) Shutdown() (err error) {
 	}
 
 	return net.ErrClosed
-}
-
-// Finalizer with MSSPI
-func (c *Conn) Finalizer() {
-	if c.handle != nil {
-		c.mu.Lock()
-		C.msspi_close(c.handle)
-		c.handle = nil
-		c.mu.Unlock()
-	}
 }
 
 // SetNextProtos with MSSPI
@@ -455,12 +448,13 @@ func (c *Conn) addMyCert() {
 // so a client never reveals its identity to a server it does not trust.
 func Client(conn *net.Conn, CertificateBytes [][]byte, hostname string, verify func() error) (c *Conn, err error) {
 	c = &Conn{conn: conn, isClient: true, verify: verify}
-	runtime.SetFinalizer(c, (*Conn).Finalizer)
 
 	c.goPointer = pointer.Save(c)
 	c.handle = C.cgo_msspi_open(c.goPointer)
 
 	if c.handle == nil {
+		pointer.Unref(c.goPointer)
+		c.goPointer = nil
 		return nil, errors.New("Client msspi_open() failed")
 	}
 
@@ -488,12 +482,13 @@ func Client(conn *net.Conn, CertificateBytes [][]byte, hostname string, verify f
 // Server with MSSPI
 func Server(conn *net.Conn, CertificateBytes [][]byte, clientAuth bool) (c *Conn, err error) {
 	c = &Conn{conn: conn, isClient: false}
-	runtime.SetFinalizer(c, (*Conn).Finalizer)
 
 	c.goPointer = pointer.Save(c)
 	c.handle = C.cgo_msspi_open(c.goPointer)
 
 	if c.handle == nil {
+		pointer.Unref(c.goPointer)
+		c.goPointer = nil
 		return nil, errors.New("Server msspi_open() failed")
 	}
 
@@ -507,6 +502,10 @@ func Server(conn *net.Conn, CertificateBytes [][]byte, clientAuth bool) (c *Conn
 	for _, cbs := range CertificateBytes {
 		ok := int(C.msspi_add_mycert(c.handle, (*C.uint8_t)(unsafe.Pointer(&cbs[0])), C.size_t(len(cbs))))
 		if ok != 1 {
+			C.msspi_close(c.handle)
+			c.handle = nil
+			pointer.Unref(c.goPointer)
+			c.goPointer = nil
 			return nil, errors.New("Server msspi_add_mycert() failed")
 		}
 	}
